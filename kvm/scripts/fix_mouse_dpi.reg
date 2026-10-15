@@ -1,0 +1,6 @@
+Windows Registry Editor Version 5.00
+
+; Fixes Barrier cursor getting stuck at (2559, 1079) on Windows High-DPI displays (125%/150%/200% scaling)
+[HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers]
+"C:\\Program Files\\Barrier\\barriers.exe"="~ HIGHDPIAWARE"
+"D:\\Barrier\\barriers.exe"="~ HIGHDPIAWARE"

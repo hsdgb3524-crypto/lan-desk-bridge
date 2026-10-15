@@ -1,0 +1,14 @@
+[Unit]
+Description=Barrier Client Smart Service (Dual-PC KVM)
+After=graphical-session.target network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/barrier-client-wrapper.sh 169.254.123.131 24800 aa-MECHREVO
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
