@@ -1,0 +1,14 @@
+[Unit]
+Description=LAN Audio Sender (Linux to Windows Headphone Bridge)
+After=pipewire.service pulseaudio.service sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lan-audio-sender -t 169.254.123.131 -p 4010
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
