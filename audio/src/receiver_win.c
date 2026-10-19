@@ -1,17 +1,23 @@
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <winsock2.h>
 #include <windows.h>
 #include <mmsystem.h>
+#include <initguid.h>
+#include <mmdeviceapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "../include/protocol.h"
 
 #define MAX_BUFFERS 128
 #define DEFAULT_BUFFERS 32
 #define MAX_CHUNK_BYTES 4096
+#define SILENCE_TIMEOUT_MS 2500  // Release audio device after 2.5s of digital silence
+#define DEVICE_CHECK_INTERVAL_MS 1500 // Check if Windows default audio endpoint switched
 
 typedef struct {
     WAVEHDR hdr;
@@ -25,6 +31,7 @@ static int g_num_buffers = DEFAULT_BUFFERS;
 static HWAVEOUT g_hWaveOut = NULL;
 static volatile LONG g_buffers_queued = 0;
 static volatile DWORD g_last_completion_time = 0;
+static WCHAR g_current_device_id[256] = {0};
 
 static BOOL WINAPI console_handler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
@@ -49,6 +56,32 @@ static void CALLBACK waveOutProc(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, 
     }
 }
 
+static BOOL get_default_device_id(WCHAR *out_id, size_t max_len) {
+    IMMDeviceEnumerator *pEnum = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&pEnum);
+    if (FAILED(hr)) return FALSE;
+
+    IMMDevice *pDev = NULL;
+    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pEnum, eRender, eMultimedia, &pDev);
+    if (FAILED(hr)) {
+        IMMDeviceEnumerator_Release(pEnum);
+        return FALSE;
+    }
+
+    LPWSTR devId = NULL;
+    hr = IMMDevice_GetId(pDev, &devId);
+    BOOL ok = FALSE;
+    if (SUCCEEDED(hr) && devId) {
+        wcsncpy(out_id, devId, max_len - 1);
+        out_id[max_len - 1] = L'\0';
+        CoTaskMemFree(devId);
+        ok = TRUE;
+    }
+    IMMDevice_Release(pDev);
+    IMMDeviceEnumerator_Release(pEnum);
+    return ok;
+}
+
 static void close_audio_device(void) {
     if (g_hWaveOut) {
         waveOutReset(g_hWaveOut);
@@ -62,10 +95,14 @@ static void close_audio_device(void) {
         g_hWaveOut = NULL;
     }
     g_buffers_queued = 0;
+    g_current_device_id[0] = L'\0';
 }
 
 static BOOL open_audio_device(int verbose) {
     close_audio_device();
+
+    // Query active default audio endpoint
+    get_default_device_id(g_current_device_id, sizeof(g_current_device_id) / sizeof(WCHAR));
 
     WAVEFORMATEX wfx;
     ZeroMemory(&wfx, sizeof(WAVEFORMATEX));
@@ -97,9 +134,20 @@ static BOOL open_audio_device(int verbose) {
 
     g_last_completion_time = GetTickCount();
     if (verbose) {
-        printf("[Audio] Audio device successfully opened (WAVE_MAPPER, 48kHz 16-bit 2ch)\n");
+        printf("[Audio] Audio output successfully opened (WAVE_MAPPER, 48kHz 16-bit stereo)\n");
     }
     return TRUE;
+}
+
+static int is_silent_chunk(const char *data, int bytes) {
+    const int16_t *samples = (const int16_t *)data;
+    int num_samples = bytes / 2;
+    for (int i = 0; i < num_samples; i++) {
+        if (abs(samples[i]) > 32) { // 32 / 32768 is negligible noise floor (~ -60dB)
+            return 0; // Contains sound
+        }
+    }
+    return 1; // Pure silence
 }
 
 static void print_usage(const char *progname) {
@@ -115,6 +163,7 @@ static void print_usage(const char *progname) {
 
 int main(int argc, char *argv[]) {
     SetConsoleCtrlHandler(console_handler, TRUE);
+    CoInitialize(NULL);
 
     int port = DEFAULT_AUDIO_PORT;
     int num_buffers = DEFAULT_BUFFERS;
@@ -129,10 +178,12 @@ int main(int argc, char *argv[]) {
             verbose = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
+            CoUninitialize();
             return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
+            CoUninitialize();
             return 1;
         }
     }
@@ -145,6 +196,7 @@ int main(int argc, char *argv[]) {
     g_buffers = (AudioBuffer *)calloc(g_num_buffers, sizeof(AudioBuffer));
     if (!g_buffers) {
         fprintf(stderr, "Failed to allocate memory for audio buffers\n");
+        CoUninitialize();
         return 1;
     }
 
@@ -153,19 +205,17 @@ int main(int argc, char *argv[]) {
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "WSAStartup failed: %d\n", WSAGetLastError());
         free(g_buffers);
+        CoUninitialize();
         return 1;
     }
-
-    // Open audio device
-    open_audio_device(verbose);
 
     // Create UDP socket
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) {
         fprintf(stderr, "Socket creation failed: %d\n", WSAGetLastError());
-        close_audio_device();
         WSACleanup();
         free(g_buffers);
+        CoUninitialize();
         return 1;
     }
 
@@ -183,20 +233,20 @@ int main(int argc, char *argv[]) {
     if (bind(sock, (struct sockaddr *)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
         fprintf(stderr, "Bind failed on port %d: %d\n", port, WSAGetLastError());
         closesocket(sock);
-        close_audio_device();
         WSACleanup();
         free(g_buffers);
+        CoUninitialize();
         return 1;
     }
 
-    // 500ms timeout for select/recv so clean exit check and device watchdog work
+    // 500ms timeout for select/recv
     DWORD timeout = 500;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 
     printf("===================================================\n");
-    printf(" LAN Audio Receiver (Windows Host)\n");
+    printf(" LAN Audio Receiver (Windows Host, Auto-Detect & Sleep-Safe)\n");
     printf(" Listening on: UDP 0.0.0.0:%d\n", port);
-    printf(" Audio Device: Default (WAVE_MAPPER, Auto-Recover)\n");
+    printf(" Audio Output: Dynamic WAVE_MAPPER (Auto-Endpoint-Follow)\n");
     printf(" Ring Buffers: %d slots (~%d ms buffer ceiling)\n",
            g_num_buffers, g_num_buffers * 5);
     printf(" Output Format: %d Hz, 16-bit, %d ch (Stereo)\n",
@@ -211,7 +261,8 @@ int main(int argc, char *argv[]) {
     uint64_t drift_drops = 0;
     uint64_t out_of_order = 0;
     DWORD last_stat_time = GetTickCount();
-    DWORD last_reopen_attempt = 0;
+    DWORD last_sound_time = 0;
+    DWORD last_device_check = 0;
 
     int max_queue_drift_threshold = (g_num_buffers * 3) / 4; // Drop 1 if queue > 75% full
 
@@ -223,10 +274,10 @@ int main(int argc, char *argv[]) {
         DWORD now = GetTickCount();
 
         if (bytes <= 0) {
-            // Idle timeout: check if device is invalid and needs opening
-            if (!g_hWaveOut && (now - last_reopen_attempt >= 1000)) {
-                last_reopen_attempt = now;
-                open_audio_device(verbose);
+            // Socket timed out (no packets from Linux): close audio device to release sound card
+            if (g_hWaveOut && (now - last_sound_time >= SILENCE_TIMEOUT_MS)) {
+                if (verbose) printf("[Audio] Network idle timeout, releasing audio device\n");
+                close_audio_device();
             }
             continue;
         }
@@ -268,28 +319,55 @@ int main(int argc, char *argv[]) {
 
         total_packets++;
 
-        // Watchdog: If device is closed, try reopening
+        // Silence Gating: Check if current audio chunk is silence
+        int silent = is_silent_chunk(pcm_payload, payload_len);
+        if (!silent) {
+            last_sound_time = now;
+        }
+
+        // If continuous silence has lasted > SILENCE_TIMEOUT_MS, release device to allow sleep / device changes
+        if (g_hWaveOut && (now - last_sound_time >= SILENCE_TIMEOUT_MS)) {
+            if (verbose) printf("[Audio] Silence detected (>2.5s), closing audio handle to save power\n");
+            close_audio_device();
+            continue;
+        }
+
+        // If sound arrived but device is closed, open device on the CURRENT active default endpoint
         if (!g_hWaveOut) {
-            if (now - last_reopen_attempt >= 1000) {
-                last_reopen_attempt = now;
-                open_audio_device(verbose);
-            }
-            if (!g_hWaveOut) {
-                continue; // Cannot render without audio device
+            if (!silent) {
+                if (!open_audio_device(verbose)) {
+                    continue; // Device cannot be opened right now
+                }
+            } else {
+                continue; // Skip rendering silence when device is closed
             }
         }
 
-        // Watchdog: If buffers are queued but no callback has fired in > 1500ms, driver may have stalled after sleep
-        if (g_buffers_queued > 4 && (now - g_last_completion_time > 1500)) {
+        // Periodic Check: Did Windows default audio endpoint switch (e.g. headphones plugged in / out)?
+        if (now - last_device_check >= DEVICE_CHECK_INTERVAL_MS) {
+            last_device_check = now;
+            WCHAR active_id[256] = {0};
+            if (get_default_device_id(active_id, sizeof(active_id) / sizeof(WCHAR))) {
+                if (wcscmp(active_id, g_current_device_id) != 0) {
+                    if (verbose) {
+                        printf("[Audio] Windows default audio endpoint changed, switching output device...\n");
+                    }
+                    open_audio_device(verbose);
+                    if (!g_hWaveOut) continue;
+                }
+            }
+        }
+
+        // Watchdog: If buffers are queued but no callback has fired in > 1200ms, driver may have stalled after sleep
+        if (g_buffers_queued > 4 && (now - g_last_completion_time > 1200)) {
             if (verbose) {
-                printf("[Audio] Detected stalled audio pipeline (sleep/device change), resetting waveOut...\n");
+                printf("[Audio] Stalled audio pipeline detected, resetting waveOut...\n");
             }
             open_audio_device(verbose);
             if (!g_hWaveOut) continue;
         }
 
         // Clock drift control: If the queue is growing towards capacity, drop this packet
-        // to keep delay minimal and prevent buffer overrun
         if (g_buffers_queued > max_queue_drift_threshold) {
             drift_drops++;
             continue;
@@ -298,7 +376,6 @@ int main(int argc, char *argv[]) {
         // Find available buffer in ring
         AudioBuffer *ab = &g_buffers[write_idx];
         if (ab->in_use) {
-            // Buffer collision; advance
             write_idx = (write_idx + 1) % g_num_buffers;
             ab = &g_buffers[write_idx];
         }
@@ -318,10 +395,7 @@ int main(int argc, char *argv[]) {
             // Device became invalid (e.g. unplugged or sleep)
             InterlockedDecrement(&g_buffers_queued);
             ab->in_use = 0;
-            if (now - last_reopen_attempt >= 1000) {
-                last_reopen_attempt = now;
-                open_audio_device(verbose);
-            }
+            open_audio_device(verbose);
         }
 
         write_idx = (write_idx + 1) % g_num_buffers;
@@ -334,12 +408,10 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\nShutting down LAN Audio Receiver...\n");
-    printf("Total packets: %llu, Lost: %llu, Drift drops: %llu\n",
-           total_packets, dropped_packets, drift_drops);
-
     closesocket(sock);
     close_audio_device();
     WSACleanup();
     free(g_buffers);
+    CoUninitialize();
     return 0;
 }

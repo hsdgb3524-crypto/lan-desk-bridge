@@ -1,7 +1,7 @@
 CC ?= gcc
 WINCC ?= x86_64-w64-mingw32-gcc
 CFLAGS ?= -O3 -Wall -Wextra -Iaudio/include
-WIN_LDFLAGS ?= -lws2_32 -lwinmm
+WIN_LDFLAGS ?= -lws2_32 -lwinmm -lole32
 LINUX_LDFLAGS ?= -lpulse -lpulse-simple
 
 BIN_DIR = bin
