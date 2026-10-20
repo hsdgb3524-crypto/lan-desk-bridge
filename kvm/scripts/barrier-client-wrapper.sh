@@ -100,9 +100,9 @@ while IFS= read -r line; do
             if (( NOW - LAST_RESET > 10 )); then
                 LAST_RESET=$NOW
                 FAIL_COUNT=0
-                echo "[Auto-Recovery] Windows Barrier server unreachable/dead for 6s. Remotely restarting server..."
+                echo "[Auto-Recovery] Windows Barrier server unreachable/dead for 6s. Remotely restarting server & ensuring audio..."
                 ssh -o ConnectTimeout=2 -o BatchMode=yes -o StrictHostKeyChecking=no win \
-                    "powershell.exe -NoProfile -Command \"Stop-Process -Name barriers -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 400; schtasks.exe /run /tn BarrierServer\"" >/dev/null 2>&1 &
+                    "powershell.exe -NoProfile -Command \"Stop-Process -Name barriers -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 400; schtasks.exe /run /tn BarrierServer; if (-not (Get-Process audio_receiver -ErrorAction SilentlyContinue)) { schtasks.exe /run /tn LanAudioReceiver }\"" >/dev/null 2>&1 &
             fi
         fi
 
